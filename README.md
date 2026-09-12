@@ -1,4 +1,6 @@
-# LocalCrawler 3.1
+# LocalCrawler 3.1.1
+
+3.1.1 修正 HTTPS 憑證驗證與特殊文字造成的摘要卡住問題；本機 14 項測試通過。瀏覽器保留 Chromium sandbox。文字預處理最多使用前 500,000 字元，完整擷取原文仍保存。此程式不是網路防火牆，不提供內網隔離。
 
 把來源變成重點。A local-first research assistant for webpages and YouTube.
 

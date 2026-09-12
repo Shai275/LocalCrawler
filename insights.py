@@ -10,6 +10,7 @@ import re
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:7b"
+MAX_ANALYSIS_CHARS = 500_000
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Insight:
 
 def source_units(text: str, url: str) -> list[dict]:
     # Keep original excerpts so users can verify every generated claim.
+    text = text[:MAX_ANALYSIS_CHARS]
     units = []
     seen = set()
     cleaned = []
@@ -38,7 +40,7 @@ def source_units(text: str, url: str) -> list[dict]:
         seen.add(paragraph)
         timestamp_link = re.search(r"https://www\.youtube\.com/watch\?v=[\w-]+&t=\d+s", paragraph)
         source_url = timestamp_link.group() if timestamp_link else url
-        paragraph = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", paragraph)
+        paragraph = re.sub(r"\[([^\[\]]+)\]\(https?://[^)]+\)", r"\1", paragraph)
         if len(re.findall(r'[A-Za-z\u4e00-\u9fff]', paragraph)) < 4:
             continue
         for start in range(0, len(paragraph), 600):
@@ -70,6 +72,8 @@ async def ollama_models() -> list[str]:
 async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAULT_MODEL, progress=None, *, units_override=None, purpose="") -> Insight:
     units = source_units(text, url) if units_override is None else units_override
     basic = basic_summary(units)
+    if len(text) > MAX_ANALYSIS_CHARS:
+        basic.warning = "分析僅使用前 500,000 字元；完整擷取原文仍已保存。"
     if mode != "ollama" or not units:
         return basic
     import httpx
@@ -87,7 +91,7 @@ async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAU
         consumed += len(line)
     if current:
         chunks.append("\n".join(current))
-    warnings = []
+    warnings = [basic.warning] if basic.warning else []
     if consumed < sum(len(f"[{u['id']}] {u['text']}") for u in units):
         warnings.append("內容較長：AI 僅分析前約 36,000 字元；完整原文仍已儲存。")
     instruction = (
@@ -159,7 +163,7 @@ async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAU
     except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
         reason = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else type(exc).__name__
         logging.warning("Local summary failed: %s", reason)
-        basic.warning = f"本機 AI 無法完成，已改用基本摘錄。原因：{reason}"
+        basic.warning = "\n".join(filter(None, [basic.warning, f"本機 AI 無法完成，已改用基本摘錄。原因：{reason}"]))
         return basic
 
 

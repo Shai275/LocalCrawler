@@ -206,8 +206,9 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                                 page.summary_warning = "來源為 YouTube 自動字幕，可能有辨識錯誤。"
                         else:
                             if crawler is None:
-                                config = BrowserConfig(headless=True, verbose=False, user_agent="LocalCrawler/3.0")
-                                crawler = await stack.enter_async_context(AsyncWebCrawler(config=config))
+                                from secure_browser import verified_strategy
+                                config = BrowserConfig(headless=True, verbose=False, ignore_https_errors=False, user_agent="LocalCrawler/3.1.1")
+                                crawler = await stack.enter_async_context(AsyncWebCrawler(config=config, crawler_strategy=verified_strategy(config)))
                             page = await fetch(crawler, url)
                     except (ValueError, asyncio.TimeoutError) as exc:
                         page = Page(url=url, source_type="youtube", error=str(exc) or "字幕讀取逾時。", attempts=1)

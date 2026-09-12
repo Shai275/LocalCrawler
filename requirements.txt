@@ -1,0 +1,5 @@
+crawl4ai==0.9.3
+youtube-transcript-api==1.2.4
+httpx>=0.28,<1
+yt-dlp==2026.8.19
+faster-whisper==1.2.1

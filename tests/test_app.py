@@ -11,6 +11,36 @@ from engine import Page
 
 
 class AppTests(unittest.TestCase):
+    def test_cloud_switching_secret_preferences_and_declined_send(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp, patch.object(app, 'PREFERENCES', Path(temp) / 'settings.json'):
+            window = app.App()
+            window.withdraw()
+            try:
+                window.model.set('local-model')
+                window.ai_mode.set('OpenAI API')
+                window.change_provider()
+                self.assertEqual(window.model.get(), '')
+                window.model.set('cloud-model')
+                window.session_keys['openai'] = 'test-private-key'
+                window.ai_mode.set('Gemini API')
+                window.change_provider()
+                self.assertEqual(window.model.get(), '')
+                window.ai_mode.set('OpenAI API')
+                window.change_provider()
+                self.assertEqual(window.model.get(), 'cloud-model')
+                window.save_preferences()
+                saved = app.PREFERENCES.read_text(encoding='utf-8')
+                self.assertNotIn('test-private-key', saved)
+                self.assertNotIn('session_keys', saved)
+                self.assertEqual(json.loads(saved)['provider_models']['ollama'], 'local-model')
+                with patch.object(app.messagebox, 'askyesno', return_value=False), patch.object(app, 'crawl_batch') as crawl:
+                    window.start(pasted_text='這是測試文字，取消雲端傳送。')
+                    crawl.assert_not_called()
+                    self.assertIsNone(window.worker)
+            finally:
+                window.destroy()
+
     def test_filter_preview_failure_and_settings(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(app, "PREFERENCES", Path(temp) / "settings.json"):
             window = app.App()

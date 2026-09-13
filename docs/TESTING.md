@@ -22,3 +22,12 @@ The Windows workflow is configured in `.github/workflows/test.yml`. It has not b
 - Real desktop interaction: advanced controls collapsed by default, model selection and example.com summary worked; saved history and report preview were checked.
 
 These results establish working flows, not factual accuracy certification. The video report still contained incorrectly recognized product names and an incorrect derived weight difference. Always check names and numerical conclusions against original timestamps. Automated tests use controlled model replies and cannot measure general model quality. External site restrictions, model availability and hardware affect results.
+# 3.2 preview validation — 2026-09-13
+
+Video-summary update: 33 tests pass. Regression cases cover inherited timestamps, timeline sampling including the ending, generic statements and invented evidence, cross-block quote location, simplified/traditional equivalence, retaining valid items, and converting unsupported interpretations to explicitly labeled original text. Gemini generation and independent claim-check responses are simulated. Manual Ollama acceptance uses the public captions of `8NYdGenlji8`; cloud model quality still requires live-account testing. Model self-checks are fallible, not proof of factual correctness.
+
+26 local tests passed, including all 3.1 regressions. New tests exercise Ollama/OpenAI/Gemini request and response contracts using simulated HTTP responses, citation rejection, bounded retries, auth/quota circuit breaking, cancellation propagation, raw export preservation, provider switching, decline-to-send, and non-persistence of secrets in preferences/reports.
+
+Real integration checks: Windows Credential Manager store/read/delete used a unique disposable fake credential; installed Ollama qwen2.5:7b returned a source-linked summary through the new shared backend.
+
+Not yet verified: live OpenAI/Gemini calls with a user's paid API credentials; arbitrary models listed by each account; complete cross-machine installation. Model listing does not establish JSON Schema compatibility. No cloud API key was used during automated tests. Current GitHub CI status is separate from local results.

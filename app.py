@@ -15,6 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from engine import Page, crawl_batch, load_results, parse_urls
 from insights import DEFAULT_MODEL
+from ai_providers import AIProviderConfig, CLOUD_PROVIDERS, LABELS, ProviderError, create_provider
+
+AI_MODES = {'本機 AI（Ollama）': 'ollama', '基本摘錄（免模型）': 'basic', 'OpenAI API': 'openai', 'Gemini API': 'gemini'}
 
 BASE = Path(__file__).resolve().parent
 PREFERENCES = BASE / "settings.json"
@@ -23,7 +26,7 @@ PREFERENCES = BASE / "settings.json"
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LocalCrawler 3.1 · 把來源變成重點")
+        self.title("LocalCrawler 3.2 預覽版 · 把來源變成重點")
         self.geometry("1100x820")
         self.minsize(940, 680)
         self.configure(bg="#f5f5f7")
@@ -45,11 +48,15 @@ class App(tk.Tk):
         self.retries = tk.StringVar(value="1")
         self.ai_mode = tk.StringVar(value="本機 AI（Ollama）")
         self.model = tk.StringVar(value=DEFAULT_MODEL)
+        self.provider_models = {'ollama': DEFAULT_MODEL, 'basic': '', 'openai': '', 'gemini': ''}
+        self.session_keys = {}
+        self.model_cache = {}
         self.preview_mode = tk.StringVar(value="重點摘要")
         self.search = tk.StringVar()
         self.filter = tk.StringVar(value="全部")
         self.last_folder = ""
         self.read_preferences()
+        self.current_provider = AI_MODES.get(self.ai_mode.get(), 'ollama')
         self.status = tk.StringVar(value="就緒 · 貼上網址即可開始")
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -62,7 +69,10 @@ class App(tk.Tk):
                 if isinstance(data.get(key), str):
                     getattr(self, key).set(data[key])
             self.last_folder = data.get("last_folder", "")
-            if data.get("settings_version") != "3.1" and self.model.get() == "qwen2.5:3b":
+            models = data.get('provider_models', {})
+            if isinstance(models, dict):
+                self.provider_models.update({k: v for k, v in models.items() if k in self.provider_models and isinstance(v, str)})
+            if data.get("settings_version") not in ('3.1', '3.2') and self.model.get() == "qwen2.5:3b":
                 self.model.set(DEFAULT_MODEL)
         except (OSError, ValueError, AttributeError):
             pass
@@ -70,7 +80,9 @@ class App(tk.Tk):
     def save_preferences(self):
         try:
             data = {key: getattr(self, key).get() for key in ("output", "delay", "timeout", "selector", "retries", "ai_mode", "model")}
-            data["settings_version"] = "3.1"
+            self.provider_models[AI_MODES.get(self.ai_mode.get(), 'ollama')] = self.model.get().strip()
+            data['provider_models'] = self.provider_models
+            data["settings_version"] = "3.2"
             data["last_folder"] = str(self.folder) if self.folder else self.last_folder
             temp = PREFERENCES.with_suffix(".tmp")
             temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -94,7 +106,7 @@ class App(tk.Tk):
         header = ttk.Frame(root)
         header.pack(fill="x")
         ttk.Label(header, text="LocalCrawler", font=("Segoe UI", 24, "bold")).pack(side="left")
-        ttk.Label(header, text="3.1   /   PRIVATE RESEARCH", foreground="#86868b").pack(side="right", pady=(12, 0))
+        ttk.Label(header, text="3.2   /   YOUR RESEARCH", foreground="#86868b").pack(side="right", pady=(12, 0))
         ttk.Label(root, text="把來源變成重點。影片筆記、文章摘要，一次整理。", foreground="#6e6e73").pack(anchor="w", pady=(4, 16))
         input_bar = ttk.Frame(root)
         input_bar.pack(fill="x")
@@ -126,14 +138,18 @@ class App(tk.Tk):
         ai_bar = ttk.Frame(self.advanced)
         ai_bar.pack(fill="x", pady=(2, 8))
         ttk.Label(ai_bar, text="摘要方式").pack(side="left")
-        self.mode_input = ttk.Combobox(ai_bar, textvariable=self.ai_mode, values=["本機 AI（Ollama）", "基本摘錄（免模型）"], state="readonly", width=23)
+        self.mode_input = ttk.Combobox(ai_bar, textvariable=self.ai_mode, values=list(AI_MODES), state="readonly", width=21)
+        self.mode_input.bind('<<ComboboxSelected>>', self.change_provider)
         self.mode_input.pack(side="left", padx=8)
-        ttk.Label(ai_bar, text="本機模型").pack(side="left")
-        self.model_input = ttk.Entry(ai_bar, textvariable=self.model, width=18)
+        ttk.Label(ai_bar, text="模型 ID").pack(side="left")
+        self.model_input = ttk.Combobox(ai_bar, textvariable=self.model, width=22)
         self.model_input.pack(side="left", padx=8)
-        self.check_ai_button = ttk.Button(ai_bar, text="檢查 AI", command=self.check_ai)
+        self.check_ai_button = ttk.Button(ai_bar, text="更新模型", command=self.check_ai)
         self.check_ai_button.pack(side="left")
-        ttk.Label(ai_bar, text="僅連接這台電腦的 Ollama", foreground="#66738b").pack(side="right")
+        self.key_button = ttk.Button(ai_bar, text="API 金鑰", command=self.key_dialog)
+        self.key_button.pack(side='left', padx=5)
+        self.ai_hint = ttk.Label(self.advanced, text=self.provider_hint(), foreground='#66738b', wraplength=970)
+        self.ai_hint.pack(anchor='w', pady=(0, 8))
         destination = ttk.Frame(self.advanced)
         destination.pack(fill="x")
         ttk.Label(destination, text="儲存位置").pack(side="left")
@@ -198,7 +214,7 @@ class App(tk.Tk):
         self.show_preview("爬取完成後，點選上方結果即可預覽文字。\n\n每次執行會建立獨立資料夾，保留先前結果。")
         ttk.Label(root, text="依 robots.txt 檢查存取規則；僅處理輸入的網址，不自動追蹤整站連結。", foreground="#66738b", font=("Microsoft JhengHei UI", 9)).pack(anchor="w", pady=(12, 0))
         self.inputs = [self.urls, self.delay_input, self.timeout_input, self.selector_input, self.output_input, self.choose_button, self.import_button, self.retries_input, self.history_button]
-        self.inputs.extend([self.mode_input, self.model_input, self.paste_button])
+        self.inputs.extend([self.mode_input, self.model_input, self.paste_button, self.key_button, self.check_ai_button])
 
     def toggle_advanced(self):
         if self.advanced.winfo_manager():
@@ -208,15 +224,90 @@ class App(tk.Tk):
             self.advanced.pack(fill="x", before=self.actions)
             self.advanced_toggle.configure(text="設定與模型 ▾")
 
+    def provider_hint(self):
+        mode = AI_MODES.get(self.ai_mode.get(), 'basic')
+        if mode in CLOUD_PROVIDERS:
+            return '雲端模式：擷取文字會傳至所選 API，可能計費。請先設定金鑰，再更新模型清單或填模型 ID。'
+        return '本機模式僅連接 127.0.0.1 的 Ollama；基本摘錄不使用 AI。'
+
+    def change_provider(self, event=None):
+        self.provider_models[self.current_provider] = self.model.get().strip()
+        self.current_provider = AI_MODES.get(self.ai_mode.get(), 'basic')
+        self.model.set(self.provider_models[self.current_provider])
+        self.model_input.configure(values=self.model_cache.get(self.current_provider, []))
+        self.ai_hint.configure(text=self.provider_hint())
+
+    def selected_backend(self, for_listing=False):
+        mode = AI_MODES.get(self.ai_mode.get(), 'basic')
+        model = self.model.get().strip() or ('listing' if for_listing else '')
+        key = ''
+        if mode in CLOUD_PROVIDERS:
+            key = self.session_keys.get(mode, '')
+            if not key:
+                from credentials import load_key
+                key = load_key(mode)
+        return create_provider(AIProviderConfig(mode, model), api_key=key, cloud_allowed=mode in CLOUD_PROVIDERS)
+
+    def key_dialog(self):
+        mode = AI_MODES.get(self.ai_mode.get(), 'basic')
+        if mode not in CLOUD_PROVIDERS:
+            messagebox.showinfo('不需要金鑰', '請先選擇 OpenAI API 或 Gemini API。', parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(LABELS[mode] + ' · API 金鑰')
+        dialog.geometry('530x235')
+        dialog.transient(self)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=20)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='貼上 API 金鑰；留空不會覆蓋已儲存的金鑰。').pack(anchor='w')
+        entry = ttk.Entry(body, show='•', width=55)
+        entry.pack(fill='x', pady=12)
+        ttk.Label(body, text='「僅本次」保留至關閉程式；「安全儲存」存入 Windows 認證管理員。\n金鑰不會寫入設定檔或研究報告。', wraplength=480).pack(anchor='w')
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=15)
+        def use(save=False):
+            value = entry.get().strip()
+            if not value:
+                return
+            try:
+                if save:
+                    from credentials import save_key
+                    save_key(mode, value)
+                self.session_keys[mode] = value
+                entry.delete(0, 'end')
+                dialog.destroy()
+            except ProviderError as exc:
+                messagebox.showerror('金鑰設定', str(exc), parent=dialog)
+        def forget():
+            try:
+                from credentials import delete_key
+                delete_key(mode)
+                self.session_keys.pop(mode, None)
+                entry.delete(0, 'end')
+                dialog.destroy()
+            except ProviderError as exc:
+                messagebox.showerror('金鑰設定', str(exc), parent=dialog)
+        ttk.Button(buttons, text='僅本次', command=use).pack(side='left')
+        ttk.Button(buttons, text='安全儲存', command=lambda: use(True)).pack(side='left', padx=8)
+        ttk.Button(buttons, text='刪除已存金鑰', command=forget).pack(side='right')
+        entry.focus_set()
+
     def check_ai(self):
-        self.check_ai_button.configure(state="disabled")
+        try:
+            backend = self.selected_backend(for_listing=True)
+        except ProviderError as exc:
+            messagebox.showerror('AI 設定', str(exc), parent=self)
+            return
+        self.check_ai_button.configure(state='disabled')
         def check():
             try:
-                from insights import ollama_models
-                models = asyncio.run(ollama_models())
-                self.events.put(("ai_check", "可用本機模型：\n" + "\n".join(models) if models else "Ollama 正在執行，但尚未安裝模型。"))
+                models = asyncio.run(backend.models())
+                self.events.put(('ai_models', (backend.name, models)))
+            except ProviderError as exc:
+                self.events.put(('ai_check', str(exc)))
             except Exception:
-                self.events.put(("ai_check", "無法連接 Ollama。請啟動 Ollama；仍可使用基本摘錄。"))
+                self.events.put(('ai_check', '模型清單讀取失敗'))
         threading.Thread(target=check, daemon=True).start()
 
     def paste_text(self):
@@ -322,10 +413,14 @@ class App(tk.Tk):
             return
         try:
             urls = parse_urls(self.urls.get("1.0", "end")) if pasted_text is None else ["使用者貼上的文字／字幕"]
-            mode = "ollama" if self.ai_mode.get() == "本機 AI（Ollama）" else "basic"
+            mode = AI_MODES.get(self.ai_mode.get(), 'basic')
             model = self.model.get().strip()
-            if mode == "ollama" and (not model or len(model) > 100 or "cloud" in model.lower()):
-                raise ValueError("請填入本機模型名稱，例如 qwen2.5:3b；此程式不使用雲端模型。")
+            provider = self.selected_backend()
+            if mode in CLOUD_PROVIDERS and not messagebox.askyesno('使用雲端摘要',
+                    f'本批 {len(urls)} 個來源的擷取文字／字幕將傳送至 {LABELS[mode]}，使用模型 {model}。\n\n'
+                    '每頁最多分析約 36,000 字元。影片分段生成後會逐項核對，另有多來源比較；每次格式失敗最多重試一次。\n'
+                    'API 可能計費，實際費用依模型及帳號而定。是否繼續？', parent=self):
+                return
             delay, timeout = float(self.delay.get()), int(self.timeout.get())
             retries = int(self.retries.get())
             if not 0.5 <= delay <= 60 or not 5 <= timeout <= 180:
@@ -371,7 +466,7 @@ class App(tk.Tk):
 
         def work():
             try:
-                asyncio.run(crawl_batch(urls, output, delay, timeout, selector, self.stop_event, lambda kind, data: self.events.put((kind, data)), retries=retries, summary_mode=mode, model=model, pasted_text=pasted_text))
+                asyncio.run(crawl_batch(urls, output, delay, timeout, selector, self.stop_event, lambda kind, data: self.events.put((kind, data)), retries=retries, summary_mode=mode, model=model, pasted_text=pasted_text, provider=provider))
             except Exception as exc:
                 logging.exception("Crawl job failed")
                 self.events.put(("fatal", str(exc)))
@@ -422,7 +517,14 @@ class App(tk.Tk):
                 elif kind == "ai_check":
                     self.check_ai_button.configure(state="normal")
                     if not self.closing:
-                        messagebox.showinfo("本機 AI 狀態", data, parent=self)
+                        messagebox.showinfo("AI 連線狀態", data, parent=self)
+                elif kind == 'ai_models':
+                    name, models = data
+                    self.model_cache[name] = models
+                    self.check_ai_button.configure(state='normal')
+                    if self.current_provider == name:
+                        self.model_input.configure(values=models)
+                    self.status.set(f'已取得 {len(models)} 個模型，請選擇支援 JSON Schema 的文字模型；清單不保證摘要相容性。')
                 elif kind == "fatal":
                     self.failure = data
                     self.show_preview(f"無法完成本次作業：\n{data}")

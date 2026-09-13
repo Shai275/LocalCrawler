@@ -109,12 +109,19 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                       selector: str, stop: threading.Event,
                       emit: Callable[[str, object], None], retries: int = 1,
                       summary_mode: str = "basic", model: str = DEFAULT_MODEL,
-                      pasted_text: str | None = None) -> list[Page]:
+                      pasted_text: str | None = None, provider=None) -> list[Page]:
     # Delay heavy imports until a job starts so the desktop opens immediately.
     from bs4 import BeautifulSoup
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
     from insights import source_markdown, summarize
     from video import fetch_video, youtube_id
+    from ai_providers import AIProviderConfig, create_provider, validate_provider_config
+
+    validate_provider_config(AIProviderConfig(summary_mode, model))
+    if summary_mode != 'basic':
+        provider = provider or create_provider(AIProviderConfig(summary_mode, model))
+        if provider.name != summary_mode:
+            raise ValueError('AI 供應商與摘要方式不一致')
 
     if not 0.5 <= delay <= 60 or not 5 <= timeout <= 180:
         raise ValueError("間隔需為 0.5–60 秒，逾時需為 5–180 秒。")
@@ -132,7 +139,8 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
         data = {"version": 3, "state": state, "urls": urls,
                 "pending_urls": [url for url in urls if url not in completed],
                 "summary_pending_urls": [p.url for p in pages if p.success and not p.summary],
-                "completed": len(pages), "error": error}
+                "completed": len(pages), "error": error,
+                "ai_provider": summary_mode, "ai_model": model if summary_mode != 'basic' else ''}
         temp = folder / "run.json.tmp"
         temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(folder / "run.json")
@@ -222,7 +230,7 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                     save_results(folder, pages)
                     emit("page", page)
                     emit("stage", f"正在整理重點 · {page.title[:50]}")
-                    insight = await summarize(page.markdown, page.final_url or page.url, summary_mode, model, lambda message: emit("stage", message))
+                    insight = await summarize(page.markdown, page.final_url or page.url, summary_mode, model, lambda message: emit("stage", message), provider=provider, title=page.title, source_type=page.source_type)
                     page.summary, page.summary_mode = insight.summary, insight.mode
                     page.summary_warning = "\n".join(filter(None, [page.summary_warning, insight.warning]))
                     page.facts = insight.facts
@@ -241,7 +249,7 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
             if not stop.is_set() and len([p for p in pages if p.success]) >= 2:
                 from comparison import compare_pages
                 emit("stage", "正在合併各來源，整理共通點與差異…")
-                report = await compare_pages(pages, folder, summary_mode, model, lambda message: emit("stage", message))
+                report = await compare_pages(pages, folder, summary_mode, model, lambda message: emit("stage", message), provider=provider)
                 if report:
                     emit("comparison", report)
 

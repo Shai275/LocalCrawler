@@ -1,4 +1,4 @@
-"""Source-linked local summaries. No cloud AI endpoints or credentials."""
+"""Source-linked summaries using the selected local or cloud provider."""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +7,8 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 import re
+from local_ai import structured_reply
+from ai_providers import LABELS, ProviderError
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:7b"
@@ -33,13 +35,18 @@ def source_units(text: str, url: str) -> list[dict]:
         if re.fullmatch(r'\[[^\]]+\]\([^)]+\)', stripped):
             continue
         cleaned.append(line)
-    for paragraph in re.split(r"\n+|(?<=[。！？])|(?<=[.!?])\s+", '\n'.join(cleaned)):
+    paragraphs = []
+    for line in cleaned:
+        # A caption timestamp applies to every sentence on that caption line.
+        stamp = re.search(r"https://www\.youtube\.com/watch\?v=[\w-]+&t=\d+s", line)
+        paragraphs.extend((part, stamp.group() if stamp else url) for part in re.split(r"(?<=[。！？])|(?<=[.!?])\s+", line))
+    for paragraph, inherited_url in paragraphs:
         paragraph = paragraph.strip(" #*\t\r")
         if len(paragraph) < 4 or paragraph in seen:
             continue
         seen.add(paragraph)
         timestamp_link = re.search(r"https://www\.youtube\.com/watch\?v=[\w-]+&t=\d+s", paragraph)
-        source_url = timestamp_link.group() if timestamp_link else url
+        source_url = timestamp_link.group() if timestamp_link else inherited_url
         paragraph = re.sub(r"\[([^\[\]]+)\]\(https?://[^)]+\)", r"\1", paragraph)
         if len(re.findall(r'[A-Za-z\u4e00-\u9fff]', paragraph)) < 4:
             continue
@@ -69,12 +76,15 @@ async def ollama_models() -> list[str]:
         return [item["name"] for item in response.json().get("models", [])]
 
 
-async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAULT_MODEL, progress=None, *, units_override=None, purpose="") -> Insight:
+async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAULT_MODEL, progress=None, *, units_override=None, purpose="", provider=None, title="", source_type="") -> Insight:
+    if mode != 'basic' and (source_type == 'youtube' or '](https://www.youtube.com/watch?v=' in text):
+        from video_insights import summarize_video
+        return await summarize_video(text, url, mode, model, progress, provider=provider, title=title)
     units = source_units(text, url) if units_override is None else units_override
     basic = basic_summary(units)
     if len(text) > MAX_ANALYSIS_CHARS:
         basic.warning = "分析僅使用前 500,000 字元；完整擷取原文仍已保存。"
-    if mode != "ollama" or not units:
+    if mode == "basic" or not units:
         return basic
     import httpx
     # Chunk bounded input and explicitly disclose anything not analyzed.
@@ -104,53 +114,50 @@ async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAU
     )
     instruction += purpose
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=8), trust_env=False) as client:
-            async def generate(content):
-                allowed_ids = sorted(set(re.findall(r"\[(S\d+)\]", content)))
-                if not allowed_ids:
-                    raise ValueError("沒有可核對的來源編號。")
-                item_schema = {"type": "object", "properties": {"text": {"type": "string"}, "sources": {"type": "array", "items": {"type": "string", "enum": allowed_ids}, "minItems": 1, "maxItems": 3}}, "required": ["text", "sources"], "additionalProperties": False}
-                schema = {"type": "object", "properties": {"overview": item_schema, "points": {"type": "array", "items": item_schema, "minItems": 1, "maxItems": 6}, "facts": {"type": "array", "items": item_schema, "maxItems": 4}, "uncertainties": {"type": "string"}}, "required": ["overview", "points", "facts", "uncertainties"], "additionalProperties": False}
-                reply = await client.post(OLLAMA_URL + "/api/chat", json={
-                    "model": model,
-                    "messages": [{"role": "system", "content": instruction + " 本次以指定 JSON 結構輸出；overview 是一句話摘要，points 是重點，facts 是數字日期條件，uncertainties 是待確認事項。每項 sources 必須填來源編號，text 使用繁體中文。"}, {"role": "user", "content": "直接輸出摘要，不要描述任務或分析步驟。以下為來源資料：\n\n" + content}],
-                    "format": schema,
-                    "stream": False,
-                    "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 3000},
-                    "keep_alive": "5m",
-                })
-                reply.raise_for_status()
-                data = reply.json()
-                answer = data.get("message", {}).get("content", "").strip()
-                if not answer or data.get("error"):
-                    raise ValueError("本機模型未回傳摘要。")
-                if data.get("done_reason") == "length":
-                    raise ValueError("模型輸出達到長度上限，未取得完整摘要。")
-                structured = json.loads(answer)
+        async def generate(content):
+            allowed_ids = sorted(set(re.findall(r"\[(S\d+)\]", content)))
+            if not allowed_ids:
+                raise ValueError("沒有可核對的來源編號。")
+            item_schema = {"type": "object", "properties": {"text": {"type": "string"}, "sources": {"type": "array", "items": {"type": "string", "enum": allowed_ids}, "minItems": 1, "maxItems": 3}}, "required": ["text", "sources"], "additionalProperties": False}
+            schema = {"type": "object", "properties": {"overview": item_schema, "points": {"type": "array", "items": item_schema, "minItems": 1, "maxItems": 6}, "facts": {"type": "array", "items": item_schema, "maxItems": 4}, "uncertainties": {"type": "string"}}, "required": ["overview", "points", "facts", "uncertainties"], "additionalProperties": False}
+            def validate(structured):
                 if not isinstance(structured, dict) or not isinstance(structured.get("points"), list) or not isinstance(structured.get("facts"), list) or not isinstance(structured.get("uncertainties"), str):
-                    raise ValueError("模型回覆的摘要欄位格式不正確。")
-                def render(item):
-                    if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not isinstance(item.get("sources"), list):
-                        raise ValueError("模型回覆的重點格式不正確。")
-                    text = item["text"].strip()
-                    if not text or len(text) > 1200:
-                        raise ValueError("模型未產生精簡完整的重點。")
-                    refs = item["sources"]
-                    if not refs or any(ref not in allowed_ids for ref in refs):
-                        raise ValueError("模型回傳不正確的來源編號。")
-                    return text + " " + " ".join(f"[{ref}]" for ref in refs)
-                return "## 一句話摘要\n\n" + render(structured["overview"]) + "\n\n## 重點\n\n" + "\n".join("- " + render(item) for item in structured["points"]) + "\n\n## 重要數字／日期／條件\n\n" + ("\n".join("- " + render(item) for item in structured["facts"]) or "未提供") + "\n\n## 待確認事項\n\n" + structured["uncertainties"]
-            drafts = []
-            for i, chunk in enumerate(chunks):
-                if progress:
-                    progress(f"本機 AI 正在整理第 {i + 1}/{len(chunks)} 段…")
-                drafts.append(await generate(chunk))
-            if len(drafts) > 1:
-                if progress:
-                    progress("本機 AI 正在合併各段重點…")
-                answer = await generate("請合併以下分段摘要，保留各自的 [Sxxx] 來源代碼：\n\n" + "\n\n".join(drafts))
-            else:
-                answer = drafts[0]
+                    raise ValueError("摘要欄位格式不正確")
+                for item in [structured.get("overview"), *structured["points"], *structured["facts"]]:
+                    if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not 1 <= len(item["text"].strip()) <= 1200:
+                        raise ValueError("重點格式不正確")
+                    refs = item.get("sources")
+                    if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or ref not in allowed_ids for ref in refs):
+                        raise ValueError("來源編號不正確")
+                if not 1 <= len(structured["points"]) <= 6 or len(structured["facts"]) > 4:
+                    raise ValueError("摘要項目數量不正確")
+            if provider is None and mode != "ollama":
+                raise ProviderError("尚未設定此 AI 供應商")
+            structured = await structured_reply(model, instruction, content, schema, validate, provider=provider)
+            if not isinstance(structured, dict) or not isinstance(structured.get("points"), list) or not isinstance(structured.get("facts"), list) or not isinstance(structured.get("uncertainties"), str):
+                raise ValueError("模型回覆的摘要欄位格式不正確。")
+            def render(item):
+                if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not isinstance(item.get("sources"), list):
+                    raise ValueError("模型回覆的重點格式不正確。")
+                text = item["text"].strip()
+                if not text or len(text) > 1200:
+                    raise ValueError("模型未產生精簡完整的重點。")
+                refs = item["sources"]
+                if not refs or any(ref not in allowed_ids for ref in refs):
+                    raise ValueError("模型回傳不正確的來源編號。")
+                return text + " " + " ".join(f"[{ref}]" for ref in refs)
+            return "## 一句話摘要\n\n" + render(structured["overview"]) + "\n\n## 重點\n\n" + "\n".join("- " + render(item) for item in structured["points"]) + "\n\n## 重要數字／日期／條件\n\n" + ("\n".join("- " + render(item) for item in structured["facts"]) or "未提供") + "\n\n## 待確認事項\n\n" + structured["uncertainties"]
+        drafts = []
+        for i, chunk in enumerate(chunks):
+            if progress:
+                progress(f"{LABELS[mode]} 正在整理第 {i + 1}/{len(chunks)} 段…")
+            drafts.append(await generate(chunk))
+        if len(drafts) > 1:
+            if progress:
+                progress(f"{LABELS[mode]} 正在合併各段重點…")
+            answer = await generate("請合併以下分段摘要，保留各自的 [Sxxx] 來源代碼：\n\n" + "\n\n".join(drafts))
+        else:
+            answer = drafts[0]
         referenced = set(re.findall(r"\[(S\d+)\]", answer))
         valid = {u["id"] for u in units}
         if not referenced or referenced - valid:
@@ -159,11 +166,11 @@ async def summarize(text: str, url: str, mode: str = "basic", model: str = DEFAU
             answer += "\n\n## 各段重點（保留全文脈絡）\n\n" + "\n\n".join(f"### 第 {i+1} 段\n\n{draft}" for i, draft in enumerate(drafts))
         lookup = {u['id']: u['url'] for u in units}
         answer = re.sub(r"\[(S\d+)\]", lambda m: f"[{m[1]}]({lookup[m[1]]})" if lookup.get(m[1], '').startswith(('http://', 'https://')) else m[0], answer)
-        return Insight(answer, f"本機 AI · {model}", "\n".join(dict.fromkeys(warnings)), units, basic.facts)
-    except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-        reason = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else type(exc).__name__
+        return Insight(answer, f"{LABELS[mode]} · {model}", "\n".join(dict.fromkeys(warnings)), units, basic.facts)
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        reason = str(exc) if isinstance(exc, ProviderError) else "AI 回覆格式或連線異常"
         logging.warning("Local summary failed: %s", reason)
-        basic.warning = "\n".join(filter(None, [basic.warning, f"本機 AI 無法完成，已改用基本摘錄。原因：{reason}"]))
+        basic.warning = "\n".join(filter(None, [basic.warning, f"{LABELS.get(mode, mode)} 無法完成，已改用基本摘錄。原因：{reason}"]))
         return basic
 
 

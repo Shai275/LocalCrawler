@@ -9,6 +9,13 @@ import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 
+# The console worker always exchanges UTF-8 JSON/progress with the GUI, even on
+# Windows systems whose active console code page cannot represent every caption.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def fetch(video_id):
     import requests
@@ -79,7 +86,8 @@ def transcribe_public_audio(video_id, workspace=None):
             title = str(info.get("title") or f"YouTube · {video_id}")
         # CPU int8 is dependable on Windows and keeps all speech recognition local.
         progress("載入本機語音模型（首次使用需下載）…")
-        model = WhisperModel("small", device="cpu", compute_type="int8")
+        from resource_policy import THREADS
+        model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=THREADS, num_workers=1)
         segments, details = model.transcribe(str(audio), beam_size=5, vad_filter=True,
                                              condition_on_previous_text=False,
                                              initial_prompt="影片標題（專有名詞參考）：" + title[:160])
@@ -87,7 +95,7 @@ def transcribe_public_audio(video_id, workspace=None):
         last_percent = -1
         for segment in segments:
             if segment.text.strip():
-                snippets.append({"start": float(segment.start), "text": segment.text.strip()})
+                snippets.append({"start": float(segment.start), 'duration': float(segment.end-segment.start), "text": segment.text.strip()})
             percent = min(100, int(segment.end / duration * 100))
             if percent >= last_percent + 5:
                 progress(f"本機語音轉文字 {percent}% · {int(segment.end)//60}:{int(segment.end)%60:02d}")
@@ -98,8 +106,43 @@ def transcribe_public_audio(video_id, workspace=None):
                 "generated": True, "audio_transcribed": True, "snippets": snippets}
 
 
+def extract_public_frames(video_id, workspace, output_folder):
+    """Download a bounded low-resolution public stream and save key frames."""
+    import yt_dlp
+    from video_frames import extract_keyframes, read_frame_text
+
+    progress("正在取得低畫質影片並挑選關鍵畫面…")
+    output = str(Path(workspace) / "visual.%(ext)s")
+    def download_progress(state):
+        if state.get('downloaded_bytes', 0) > 300 * 1024 * 1024:
+            raise ValueError('影片超過 300 MB 上限。')
+    options = {
+        "format": "bestvideo[height<=720][vcodec^=avc1]/best[height<=720][vcodec^=avc1]/bestvideo[height<=720][ext=mp4]/best[height<=720]",
+        "outtmpl": output, "noplaylist": True, "quiet": True, "no_warnings": True,
+        "noprogress": True, "max_filesize": 300 * 1024 * 1024, "socket_timeout": 20,
+        'progress_hooks': [download_progress],
+    }
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(options) as downloader:
+        info = downloader.extract_info(url, download=False)
+        duration = info.get("duration") if info else None
+        if not info or info.get('is_live') or not isinstance(duration, (int, float)) or duration <= 0 or duration > 90 * 60:
+            raise ValueError("畫面分析目前限 90 分鐘內的公開影片。")
+        downloader.process_ie_result(info, download=True)
+    videos = list(Path(workspace).glob("visual.*"))
+    if not videos:
+        raise ValueError("公開影片下載未產生可分析的畫面。")
+    frames = extract_keyframes(videos[0], output_folder, duration)
+    if not frames:
+        raise ValueError("影片沒有可使用的關鍵影格。")
+    progress("正在離線辨識關鍵影格文字…")
+    return read_frame_text(frames, output_folder)
+
+
 if __name__ == "__main__":
     try:
+        from resource_policy import configure_worker
+        resource_status = configure_worker()
         try:
             result = fetch(sys.argv[1])
         except Exception as subtitle_error:
@@ -107,6 +150,11 @@ if __name__ == "__main__":
                 raise
             result = transcribe_public_audio(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
             result["subtitle_fallback"] = type(subtitle_error).__name__
+        if len(sys.argv) > 3 and sys.argv[3]:
+            try:
+                result["frames"] = extract_public_frames(sys.argv[1], sys.argv[2], sys.argv[3])
+            except Exception as frame_error:
+                result["frame_warning"] = "畫面擷取失敗（" + type(frame_error).__name__ + "）；字幕摘要仍可使用。"
     except Exception as exc:
         name = type(exc).__name__
         messages = {
@@ -118,4 +166,6 @@ if __name__ == "__main__":
             "NoTranscriptFound": "找不到可用字幕。",
         }
         result = {"error": messages.get(name, f"無法處理公開影片音訊（{name}）。") + " 請確認影片可公開播放，或改用「貼上文字／字幕」。"}
+    if 'resource_status' in locals():
+        result['resource_status'] = resource_status
     print(json.dumps(result, ensure_ascii=False))

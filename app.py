@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 import webbrowser
 from pathlib import Path
 import queue
@@ -13,20 +14,21 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from runtime_paths import APP_DIR as BASE, DATA_DIR, DOWNLOADS_DIR, LOG_FILE, PREFERENCES_FILE
 from engine import Page, crawl_batch, load_results, parse_urls
 from insights import DEFAULT_MODEL
 from ai_providers import AIProviderConfig, CLOUD_PROVIDERS, LABELS, ProviderError, create_provider
+from deliverables import export_deliverables as build_deliverables
 
 AI_MODES = {'本機 AI（Ollama）': 'ollama', '基本摘錄（免模型）': 'basic', 'OpenAI API': 'openai', 'Gemini API': 'gemini'}
 
-BASE = Path(__file__).resolve().parent
-PREFERENCES = BASE / "settings.json"
+PREFERENCES = PREFERENCES_FILE
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LocalCrawler 3.2 預覽版 · 把來源變成重點")
+        self.title("LocalCrawler 3.4 預覽版 · 看懂字幕與畫面")
         self.geometry("1100x820")
         self.minsize(940, 680)
         self.configure(bg="#f5f5f7")
@@ -41,11 +43,13 @@ class App(tk.Tk):
         self.failure = ""
         self.view_only = False
         self.active_urls = []
-        self.output = tk.StringVar(value=str(BASE / "downloads"))
+        self.output = tk.StringVar(value=str(DOWNLOADS_DIR))
         self.delay = tk.StringVar(value="1")
         self.timeout = tk.StringVar(value="30")
         self.selector = tk.StringVar()
         self.retries = tk.StringVar(value="1")
+        self.analyze_frames = tk.BooleanVar(value=False)
+        self.vision_model = tk.StringVar(value="qwen2.5vl:3b")
         self.ai_mode = tk.StringVar(value="本機 AI（Ollama）")
         self.model = tk.StringVar(value=DEFAULT_MODEL)
         self.provider_models = {'ollama': DEFAULT_MODEL, 'basic': '', 'openai': '', 'gemini': ''}
@@ -68,11 +72,15 @@ class App(tk.Tk):
             for key in ("output", "delay", "timeout", "selector", "retries", "ai_mode", "model"):
                 if isinstance(data.get(key), str):
                     getattr(self, key).set(data[key])
+            if isinstance(data.get("analyze_frames"), bool):
+                self.analyze_frames.set(data["analyze_frames"])
+            if isinstance(data.get("vision_model"), str):
+                self.vision_model.set(data["vision_model"])
             self.last_folder = data.get("last_folder", "")
             models = data.get('provider_models', {})
             if isinstance(models, dict):
                 self.provider_models.update({k: v for k, v in models.items() if k in self.provider_models and isinstance(v, str)})
-            if data.get("settings_version") not in ('3.1', '3.2') and self.model.get() == "qwen2.5:3b":
+            if data.get("settings_version") not in ('3.1', '3.2', '3.3', '3.4') and self.model.get() == "qwen2.5:3b":
                 self.model.set(DEFAULT_MODEL)
         except (OSError, ValueError, AttributeError):
             pass
@@ -82,7 +90,9 @@ class App(tk.Tk):
             data = {key: getattr(self, key).get() for key in ("output", "delay", "timeout", "selector", "retries", "ai_mode", "model")}
             self.provider_models[AI_MODES.get(self.ai_mode.get(), 'ollama')] = self.model.get().strip()
             data['provider_models'] = self.provider_models
-            data["settings_version"] = "3.2"
+            data["analyze_frames"] = self.analyze_frames.get()
+            data["vision_model"] = self.vision_model.get().strip()
+            data["settings_version"] = "3.4"
             data["last_folder"] = str(self.folder) if self.folder else self.last_folder
             temp = PREFERENCES.with_suffix(".tmp")
             temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -91,138 +101,276 @@ class App(tk.Tk):
             logging.exception("Could not save settings")
 
     def _build(self):
+        colors = {
+            "canvas": "#121317", "panel": "#1a1b1f", "panel_high": "#22242b",
+            "input": "#0d0e12", "border": "#30313a", "border_high": "#464754",
+            "text": "#f3f4f6", "muted": "#a0a2ae", "subtle": "#666977",
+            "primary": "#7376ff", "primary_active": "#5e61e8", "success": "#4edea3",
+            "warning": "#ffb95f", "danger": "#ff7b72",
+        }
+        self.ui_colors = colors
+        self.title("LocalCrawler 3.4 · AI Research Workspace")
+        self.geometry("1420x900")
+        self.minsize(1120, 720)
+        self.configure(bg=colors["canvas"])
+
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TFrame", background="#f5f5f7")
-        style.configure("TLabel", background="#f5f5f7", foreground="#1d1d1f", font=("Microsoft JhengHei UI", 10))
-        style.configure("TButton", font=("Microsoft JhengHei UI", 10), padding=(14, 8), borderwidth=0, background="#e8e8ed")
-        style.configure("Accent.TButton", background="#0071e3", foreground="white")
-        style.configure("Treeview", borderwidth=0, background="white", fieldbackground="white")
-        style.map("Accent.TButton", background=[("active", "#174899"), ("disabled", "#98a6bb")])
-        style.configure("Treeview", rowheight=30, font=("Microsoft JhengHei UI", 10))
-        style.configure("Treeview.Heading", font=("Microsoft JhengHei UI", 10, "bold"))
-        root = ttk.Frame(self, padding=24)
-        root.pack(fill="both", expand=True)
-        header = ttk.Frame(root)
+        style.configure("TFrame", background=colors["canvas"])
+        style.configure("Panel.TFrame", background=colors["panel"])
+        style.configure("TLabel", background=colors["canvas"], foreground=colors["text"], font=("Microsoft JhengHei UI", 10))
+        style.configure("Panel.TLabel", background=colors["panel"], foreground=colors["text"], font=("Microsoft JhengHei UI", 10))
+        style.configure("Muted.TLabel", background=colors["canvas"], foreground=colors["muted"], font=("Microsoft JhengHei UI", 9))
+        style.configure("PanelMuted.TLabel", background=colors["panel"], foreground=colors["muted"], font=("Microsoft JhengHei UI", 9))
+        style.configure("Eyebrow.TLabel", background=colors["canvas"], foreground=colors["muted"], font=("Consolas", 9, "bold"))
+        style.configure("PanelEyebrow.TLabel", background=colors["panel"], foreground=colors["muted"], font=("Consolas", 9, "bold"))
+        style.configure("Heading.TLabel", background=colors["canvas"], foreground=colors["text"], font=("Segoe UI", 17, "bold"))
+        style.configure("PanelHeading.TLabel", background=colors["panel"], foreground=colors["text"], font=("Segoe UI", 13, "bold"))
+        style.configure("TButton", font=("Microsoft JhengHei UI", 9), padding=(11, 7), borderwidth=1,
+                        background=colors["panel_high"], foreground=colors["text"], bordercolor=colors["border"])
+        style.map("TButton", background=[("active", "#2c2e37"), ("disabled", colors["panel"])],
+                  foreground=[("disabled", colors["subtle"])], bordercolor=[("active", colors["border_high"])])
+        style.configure("Accent.TButton", background=colors["primary"], foreground="#ffffff", bordercolor=colors["primary"],
+                        font=("Microsoft JhengHei UI", 10, "bold"), padding=(14, 9))
+        style.map("Accent.TButton", background=[("active", colors["primary_active"]), ("disabled", "#34354d")],
+                  foreground=[("disabled", "#77798f")])
+        style.configure("Quiet.TButton", padding=(8, 5))
+        style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["text"], insertcolor=colors["text"],
+                        bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"], padding=7)
+        style.map("TEntry", bordercolor=[("focus", colors["primary"])])
+        style.configure("TSpinbox", fieldbackground=colors["input"], foreground=colors["text"], arrowcolor=colors["muted"],
+                        bordercolor=colors["border"], padding=5)
+        style.configure("TCombobox", fieldbackground=colors["input"], background=colors["panel_high"], foreground=colors["text"],
+                        arrowcolor=colors["muted"], bordercolor=colors["border"], padding=5)
+        style.map("TCombobox", fieldbackground=[("readonly", colors["input"])], foreground=[("readonly", colors["text"])],
+                  bordercolor=[("focus", colors["primary"])])
+        style.configure("TCheckbutton", background=colors["panel"], foreground=colors["text"], font=("Microsoft JhengHei UI", 9))
+        style.map("TCheckbutton", background=[("active", colors["panel"])], indicatorcolor=[("selected", colors["primary"])])
+        style.configure("Horizontal.TProgressbar", troughcolor=colors["input"], background=colors["primary"], borderwidth=0)
+        style.configure("Treeview", borderwidth=0, relief="flat", rowheight=39, background=colors["panel"],
+                        fieldbackground=colors["panel"], foreground=colors["text"], font=("Microsoft JhengHei UI", 9))
+        style.map("Treeview", background=[("selected", "#343654")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=colors["input"], foreground=colors["muted"], relief="flat",
+                        borderwidth=0, font=("Consolas", 9, "bold"), padding=(8, 8))
+        style.map("Treeview.Heading", background=[("active", colors["panel_high"])])
+        style.configure("Vertical.TScrollbar", background=colors["panel_high"], troughcolor=colors["canvas"], borderwidth=0,
+                        arrowcolor=colors["muted"])
+
+        header = tk.Frame(self, bg=colors["panel"], height=60, highlightthickness=1, highlightbackground=colors["border"])
         header.pack(fill="x")
-        ttk.Label(header, text="LocalCrawler", font=("Segoe UI", 24, "bold")).pack(side="left")
-        ttk.Label(header, text="3.2   /   YOUR RESEARCH", foreground="#86868b").pack(side="right", pady=(12, 0))
-        ttk.Label(root, text="把來源變成重點。影片筆記、文章摘要，一次整理。", foreground="#6e6e73").pack(anchor="w", pady=(4, 16))
-        input_bar = ttk.Frame(root)
-        input_bar.pack(fill="x")
-        ttk.Label(input_bar, text="貼上連結，每行一個", font=("Microsoft JhengHei UI", 11, "bold")).pack(side="left")
-        self.import_button = ttk.Button(input_bar, text="匯入網址 .txt", command=self.import_urls)
-        self.import_button.pack(side="right")
-        self.paste_button = ttk.Button(input_bar, text="貼上文字／字幕", command=self.paste_text)
-        self.paste_button.pack(side="right", padx=8)
-        self.urls = tk.Text(root, height=4, wrap="none", font=("Consolas", 11), relief="flat", padx=12, pady=10, undo=True)
-        self.urls.pack(fill="x", pady=8)
+        header.pack_propagate(False)
+        brand = tk.Frame(header, bg=colors["panel"])
+        brand.pack(side="left", padx=20, fill="y")
+        tk.Label(brand, text="◆", bg=colors["panel"], fg=colors["primary"], font=("Segoe UI Symbol", 14)).pack(side="left", pady=17)
+        tk.Label(brand, text="LocalCrawler", bg=colors["panel"], fg=colors["text"], font=("Segoe UI", 13, "bold")).pack(side="left", padx=(8, 0), pady=17)
+        tk.Label(brand, text="AI RESEARCH WORKSPACE", bg=colors["panel"], fg=colors["muted"], font=("Consolas", 9)).pack(side="left", padx=(14, 0), pady=20)
+        header_right = tk.Frame(header, bg=colors["panel"])
+        header_right.pack(side="right", padx=18, fill="y")
+        self.provider_badge = tk.Label(header_right, text="", bg="#13251e", fg=colors["success"],
+                                       font=("Consolas", 9, "bold"), padx=9, pady=5,
+                                       highlightthickness=1, highlightbackground="#275441")
+        self.provider_badge.pack(side="left", pady=15)
+        self.model_badge = tk.Label(header_right, text="", bg=colors["panel_high"], fg=colors["muted"],
+                                    font=("Consolas", 9), padx=9, pady=5,
+                                    highlightthickness=1, highlightbackground=colors["border"])
+        self.model_badge.pack(side="left", padx=(8, 0), pady=15)
+
+        workspace = tk.PanedWindow(self, orient="horizontal", bg=colors["border"], sashwidth=1, sashrelief="flat",
+                                   borderwidth=0, opaqueresize=True)
+        workspace.pack(fill="both", expand=True)
+
+        left = ttk.Frame(workspace, style="Panel.TFrame", padding=(18, 18))
+        center = ttk.Frame(workspace, padding=(22, 18))
+        right = ttk.Frame(workspace, style="Panel.TFrame", padding=(16, 18))
+        workspace.add(left, minsize=300, width=338)
+        workspace.add(center, minsize=480, stretch="always")
+        workspace.add(right, minsize=315, width=370)
+
+        ttk.Label(left, text="01 / SOURCES", style="PanelEyebrow.TLabel").pack(anchor="w")
+        ttk.Label(left, text="建立研究工作", style="PanelHeading.TLabel").pack(anchor="w", pady=(3, 3))
+        ttk.Label(left, text="貼上網頁或 YouTube 連結，每行一個。", style="PanelMuted.TLabel").pack(anchor="w", pady=(0, 10))
+        self.urls = tk.Text(left, height=6, wrap="none", undo=True, relief="flat", borderwidth=0,
+                            bg=colors["input"], fg=colors["text"], insertbackground=colors["text"],
+                            selectbackground=colors["primary"], font=("Consolas", 10), padx=11, pady=9,
+                            highlightthickness=1, highlightbackground=colors["border"], highlightcolor=colors["primary"])
+        self.urls.pack(fill="x")
         self.urls.insert("1.0", "https://example.com")
-        self.advanced = ttk.Frame(root)
-        self.advanced_toggle = ttk.Button(root, text="設定與模型 ▸", command=self.toggle_advanced)
-        self.advanced_toggle.pack(anchor="w", pady=(0, 6))
-        settings = ttk.Frame(self.advanced)
-        settings.pack(fill="x", pady=(2, 8))
-        ttk.Label(settings, text="間隔（秒）").pack(side="left")
-        self.delay_input = ttk.Spinbox(settings, from_=0.5, to=60, increment=0.5, textvariable=self.delay, width=5)
-        self.delay_input.pack(side="left", padx=(6, 18))
-        ttk.Label(settings, text="逾時（秒）").pack(side="left")
-        self.timeout_input = ttk.Spinbox(settings, from_=5, to=180, textvariable=self.timeout, width=5)
-        self.timeout_input.pack(side="left", padx=(6, 18))
-        ttk.Label(settings, text="CSS 範圍（選填，如 article）").pack(side="left")
-        self.selector_input = ttk.Entry(settings, textvariable=self.selector, width=12)
-        self.selector_input.pack(side="left", padx=6, fill="x", expand=True)
-        ttk.Label(settings, text="自動重試").pack(side="left", padx=(8, 4))
-        self.retries_input = ttk.Spinbox(settings, from_=0, to=2, textvariable=self.retries, width=3)
-        self.retries_input.pack(side="left")
-        ai_bar = ttk.Frame(self.advanced)
-        ai_bar.pack(fill="x", pady=(2, 8))
-        ttk.Label(ai_bar, text="摘要方式").pack(side="left")
-        self.mode_input = ttk.Combobox(ai_bar, textvariable=self.ai_mode, values=list(AI_MODES), state="readonly", width=21)
+        input_actions = ttk.Frame(left, style="Panel.TFrame")
+        self.input_actions = input_actions
+        input_actions.pack(fill="x", pady=(8, 11))
+        self.import_button = ttk.Button(input_actions, text="匯入 .txt", style="Quiet.TButton", command=self.import_urls)
+        self.import_button.pack(side="left", fill="x", expand=True)
+        self.paste_button = ttk.Button(input_actions, text="貼上文字／字幕", style="Quiet.TButton", command=self.paste_text)
+        self.paste_button.pack(side="left", padx=(7, 0), fill="x", expand=True)
+
+        self.advanced = ttk.Frame(left, style="Panel.TFrame")
+        self.advanced_toggle = ttk.Button(left, text="模型與擷取設定  ▸", command=self.toggle_advanced)
+        self.advanced_toggle.pack(fill="x", pady=(0, 8))
+        timing = ttk.Frame(self.advanced, style="Panel.TFrame")
+        timing.pack(fill="x", pady=(0, 7))
+        ttk.Label(timing, text="間隔", style="PanelMuted.TLabel").pack(side="left")
+        self.delay_input = ttk.Spinbox(timing, from_=0.5, to=60, increment=0.5, textvariable=self.delay, width=4)
+        self.delay_input.pack(side="left", padx=(5, 10))
+        ttk.Label(timing, text="逾時", style="PanelMuted.TLabel").pack(side="left")
+        self.timeout_input = ttk.Spinbox(timing, from_=5, to=180, textvariable=self.timeout, width=4)
+        self.timeout_input.pack(side="left", padx=(5, 10))
+        ttk.Label(timing, text="重試", style="PanelMuted.TLabel").pack(side="left")
+        self.retries_input = ttk.Spinbox(timing, from_=0, to=2, textvariable=self.retries, width=3)
+        self.retries_input.pack(side="left", padx=(5, 0))
+        selector_row = ttk.Frame(self.advanced, style="Panel.TFrame")
+        selector_row.pack(fill="x", pady=(0, 7))
+        ttk.Label(selector_row, text="CSS", style="PanelMuted.TLabel", width=7).pack(side="left")
+        self.selector_input = ttk.Entry(selector_row, textvariable=self.selector)
+        self.selector_input.pack(side="left", fill="x", expand=True)
+        provider_row = ttk.Frame(self.advanced, style="Panel.TFrame")
+        provider_row.pack(fill="x", pady=(0, 7))
+        ttk.Label(provider_row, text="摘要", style="PanelMuted.TLabel", width=7).pack(side="left")
+        self.mode_input = ttk.Combobox(provider_row, textvariable=self.ai_mode, values=list(AI_MODES), state="readonly", width=20)
         self.mode_input.bind('<<ComboboxSelected>>', self.change_provider)
-        self.mode_input.pack(side="left", padx=8)
-        ttk.Label(ai_bar, text="模型 ID").pack(side="left")
-        self.model_input = ttk.Combobox(ai_bar, textvariable=self.model, width=22)
-        self.model_input.pack(side="left", padx=8)
-        self.check_ai_button = ttk.Button(ai_bar, text="更新模型", command=self.check_ai)
-        self.check_ai_button.pack(side="left")
-        self.key_button = ttk.Button(ai_bar, text="API 金鑰", command=self.key_dialog)
-        self.key_button.pack(side='left', padx=5)
-        self.ai_hint = ttk.Label(self.advanced, text=self.provider_hint(), foreground='#66738b', wraplength=970)
-        self.ai_hint.pack(anchor='w', pady=(0, 8))
-        destination = ttk.Frame(self.advanced)
-        destination.pack(fill="x")
-        ttk.Label(destination, text="儲存位置").pack(side="left")
+        self.mode_input.pack(side="left", fill="x", expand=True)
+        model_row = ttk.Frame(self.advanced, style="Panel.TFrame")
+        model_row.pack(fill="x", pady=(0, 7))
+        ttk.Label(model_row, text="模型", style="PanelMuted.TLabel", width=7).pack(side="left")
+        self.model_input = ttk.Combobox(model_row, textvariable=self.model, width=20)
+        self.model_input.pack(side="left", fill="x", expand=True)
+        ai_actions = ttk.Frame(self.advanced, style="Panel.TFrame")
+        ai_actions.pack(fill="x", pady=(0, 7))
+        self.check_ai_button = ttk.Button(ai_actions, text="更新模型", style="Quiet.TButton", command=self.check_ai)
+        self.check_ai_button.pack(side="left", fill="x", expand=True)
+        self.key_button = ttk.Button(ai_actions, text="API 金鑰", style="Quiet.TButton", command=self.key_dialog)
+        self.key_button.pack(side="left", padx=(7, 0), fill="x", expand=True)
+        self.ai_hint = ttk.Label(self.advanced, text=self.provider_hint(), style="PanelMuted.TLabel", wraplength=285, justify="left")
+        self.frames_input = ttk.Checkbutton(self.advanced, text="融合字幕與關鍵影格（最多 12 張）", variable=self.analyze_frames)
+        self.frames_input.pack(anchor="w", pady=(0, 7))
+        vision_row = ttk.Frame(self.advanced, style="Panel.TFrame")
+        vision_row.pack(fill="x", pady=(0, 7))
+        ttk.Label(vision_row, text="視覺模型", style="PanelMuted.TLabel", width=9).pack(side="left")
+        self.vision_model_input = ttk.Entry(vision_row, textvariable=self.vision_model)
+        self.vision_model_input.pack(side="left", fill="x", expand=True)
+        destination = ttk.Frame(self.advanced, style="Panel.TFrame")
+        destination.pack(fill="x", pady=(0, 8))
         self.output_input = ttk.Entry(destination, textvariable=self.output)
-        self.output_input.pack(side="left", padx=8, fill="x", expand=True)
-        self.choose_button = ttk.Button(destination, text="選擇資料夾", command=self.choose)
-        self.choose_button.pack(side="left")
-        actions = ttk.Frame(root)
-        self.actions = actions
-        actions.pack(fill="x", pady=12)
-        self.start_button = ttk.Button(actions, text="開始整理", style="Accent.TButton", command=self.start)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(actions, text="停止", command=self.stop, state="disabled")
-        self.stop_button.pack(side="left", padx=8)
-        self.open_button = ttk.Button(actions, text="開啟結果資料夾", command=self.open_folder, state="disabled")
-        self.open_button.pack(side="left")
-        self.retry_button = ttk.Button(actions, text="重試失敗項目", command=self.retry_failed, state="disabled")
-        self.retry_button.pack(side="left", padx=8)
-        ttk.Label(actions, text="Markdown  ·  JSON  ·  CSV", foreground="#66738b").pack(side="right")
-        self.progress = ttk.Progressbar(root, mode="determinate")
-        self.progress.pack(fill="x")
-        ttk.Label(root, textvariable=self.status, wraplength=960).pack(anchor="w", pady=(7, 12))
-        filter_bar = ttk.Frame(root)
-        filter_bar.pack(fill="x", pady=(0, 8))
-        ttk.Label(filter_bar, text="搜尋結果").pack(side="left")
-        search_input = ttk.Entry(filter_bar, textvariable=self.search, width=26)
-        search_input.pack(side="left", padx=8, fill="x", expand=True)
-        ttk.Combobox(filter_bar, textvariable=self.filter, values=["全部", "成功", "失敗"], state="readonly", width=6).pack(side="left", padx=4)
-        self.history_button = ttk.Button(filter_bar, text="開啟歷史結果", command=self.open_history)
-        self.history_button.pack(side="right")
-        self.search.trace_add("write", lambda *_: self.refresh_table())
-        self.filter.trace_add("write", lambda *_: self.refresh_table())
-        panes = ttk.Panedwindow(root, orient="vertical")
-        panes.pack(fill="both", expand=True)
-        table_frame = ttk.Frame(panes)
-        panes.add(table_frame, weight=1)
-        self.table = ttk.Treeview(table_frame, columns=("state", "title", "url"), show="headings", height=5)
-        for key, title, width in [("state", "狀態", 80), ("title", "網頁標題", 240), ("url", "網址", 550)]:
-            self.table.heading(key, text=title)
-            self.table.column(key, width=width, minwidth=60, stretch=key != "state")
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        self.table.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self.table.pack(fill="both", expand=True)
-        self.table.bind("<<TreeviewSelect>>", self.preview)
-        preview_frame = ttk.Frame(panes)
-        panes.add(preview_frame, weight=2)
-        preview_bar = ttk.Frame(preview_frame)
-        preview_bar.pack(fill="x", pady=(8, 6))
-        ttk.Label(preview_bar, text="閱讀報告", font=("Microsoft JhengHei UI", 11, "bold")).pack(side="left")
-        ttk.Combobox(preview_bar, textvariable=self.preview_mode, values=["重點摘要", "原始內容", "來源對照", "整批比較", "比較來源"], width=10, state="readonly").pack(side="left", padx=12)
+        self.output_input.pack(side="left", fill="x", expand=True)
+        self.choose_button = ttk.Button(destination, text="儲存位置", style="Quiet.TButton", command=self.choose)
+        self.choose_button.pack(side="left", padx=(7, 0))
+
+        self.actions = ttk.Frame(left, style="Panel.TFrame")
+        self.actions.pack(fill="x", pady=(1, 8))
+        self.start_button = ttk.Button(self.actions, text="開始整理來源", style="Accent.TButton", command=self.start)
+        self.start_button.pack(fill="x")
+        secondary_actions = ttk.Frame(self.actions, style="Panel.TFrame")
+        secondary_actions.pack(fill="x", pady=(7, 0))
+        self.stop_button = ttk.Button(secondary_actions, text="停止", style="Quiet.TButton", command=self.stop, state="disabled")
+        self.stop_button.pack(side="left", fill="x", expand=True)
+        self.retry_button = ttk.Button(secondary_actions, text="重試失敗", style="Quiet.TButton", command=self.retry_failed, state="disabled")
+        self.retry_button.pack(side="left", padx=(7, 0), fill="x", expand=True)
+        self.progress = ttk.Progressbar(left, mode="determinate", style="Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=(3, 8))
+        status_card = tk.Frame(left, bg=colors["input"], highlightthickness=1, highlightbackground=colors["border"])
+        status_card.pack(fill="x")
+        tk.Label(status_card, text="●", bg=colors["input"], fg=colors["success"], font=("Segoe UI", 9)).pack(side="left", padx=(10, 5), pady=9)
+        tk.Label(status_card, textvariable=self.status, bg=colors["input"], fg=colors["muted"],
+                 font=("Microsoft JhengHei UI", 9), wraplength=270, justify="left", anchor="w").pack(side="left", fill="x", expand=True, padx=(0, 8), pady=8)
+        folder_actions = ttk.Frame(left, style="Panel.TFrame")
+        folder_actions.pack(fill="x", side="bottom", pady=(10, 0))
+        self.open_button = ttk.Button(folder_actions, text="開啟結果", style="Quiet.TButton", command=self.open_folder, state="disabled")
+        self.open_button.pack(side="left", fill="x", expand=True)
+        self.history_button = ttk.Button(folder_actions, text="歷史資料", style="Quiet.TButton", command=self.open_history)
+        self.history_button.pack(side="left", padx=(7, 0), fill="x", expand=True)
+
+        center_header = ttk.Frame(center)
+        center_header.pack(fill="x", pady=(0, 12))
+        title_block = ttk.Frame(center_header)
+        title_block.pack(side="left")
+        ttk.Label(title_block, text="02 / SYNTHESIS", style="Eyebrow.TLabel").pack(anchor="w")
+        ttk.Label(title_block, text="研究報告", style="Heading.TLabel").pack(anchor="w", pady=(2, 0))
+        view_actions = ttk.Frame(center_header)
+        view_actions.pack(side="right", anchor="s")
+        ttk.Combobox(view_actions, textvariable=self.preview_mode,
+                     values=["重點摘要", "原始內容", "來源對照", "整批比較", "比較來源"],
+                     width=10, state="readonly").pack(side="left", padx=(0, 7))
         self.preview_mode.trace_add("write", lambda *_: self.preview())
-        self.copy_button = ttk.Button(preview_bar, text="複製內容", command=self.copy_content, state="disabled")
-        self.copy_button.pack(side="right")
-        self.file_button = ttk.Button(preview_bar, text="開啟 Markdown", command=self.open_markdown, state="disabled")
-        self.file_button.pack(side="right", padx=6)
-        self.preview_text = tk.Text(preview_frame, wrap="word", height=8, font=("Microsoft JhengHei UI", 11), relief="flat", padx=12, pady=10, state="disabled")
-        preview_scroll = ttk.Scrollbar(preview_frame, command=self.preview_text.yview)
+        self.copy_button = ttk.Button(view_actions, text="複製", style="Quiet.TButton", command=self.copy_content, state="disabled")
+        self.copy_button.pack(side="left")
+        self.file_button = ttk.Button(view_actions, text="Markdown", style="Quiet.TButton", command=self.open_markdown, state="disabled")
+        self.file_button.pack(side="left", padx=(7, 0))
+        report_actions = ttk.Frame(center)
+        report_actions.pack(fill="x", pady=(0, 10))
+        self.export_button = ttk.Button(report_actions, text="匯出 PDF / Notion / Markdown / Canvas", style="Accent.TButton",
+                                        command=self.export_report, state="disabled")
+        self.export_button.pack(side="left")
+        ttk.Button(report_actions, text="影格與時間證據", command=self.open_evidence).pack(side="left", padx=(8, 0))
+        ttk.Label(report_actions, text="MARKDOWN · SOURCE-LINKED", style="Eyebrow.TLabel").pack(side="right", pady=9)
+        preview_shell = tk.Frame(center, bg=colors["panel"], highlightthickness=1, highlightbackground=colors["border"])
+        preview_shell.pack(fill="both", expand=True)
+        self.preview_text = tk.Text(preview_shell, wrap="word", height=8, state="disabled", relief="flat", borderwidth=0,
+                                    bg=colors["panel"], fg="#d8d9df", insertbackground=colors["text"],
+                                    selectbackground="#3e4172", font=("Microsoft JhengHei UI", 11), spacing1=3,
+                                    spacing2=2, spacing3=8, padx=24, pady=22)
+        preview_scroll = ttk.Scrollbar(preview_shell, command=self.preview_text.yview, style="Vertical.TScrollbar")
         self.preview_text.configure(yscrollcommand=preview_scroll.set)
         preview_scroll.pack(side="right", fill="y")
         self.preview_text.pack(fill="both", expand=True)
-        self.show_preview("爬取完成後，點選上方結果即可預覽文字。\n\n每次執行會建立獨立資料夾，保留先前結果。")
-        ttk.Label(root, text="依 robots.txt 檢查存取規則；僅處理輸入的網址，不自動追蹤整站連結。", foreground="#66738b", font=("Microsoft JhengHei UI", 9)).pack(anchor="w", pady=(12, 0))
+        self.show_preview("研究工作台已就緒。\n\n在左側貼上網頁或 YouTube 連結，選擇摘要方式後開始整理。完成後可在右側切換來源，並由這裡閱讀有時間點與證據連結的報告。")
+
+        ttk.Label(right, text="03 / EVIDENCE", style="PanelEyebrow.TLabel").pack(anchor="w")
+        ttk.Label(right, text="來源與驗證", style="PanelHeading.TLabel").pack(anchor="w", pady=(3, 3))
+        ttk.Label(right, text="選取來源以切換中央報告。", style="PanelMuted.TLabel").pack(anchor="w", pady=(0, 10))
+        filter_bar = ttk.Frame(right, style="Panel.TFrame")
+        filter_bar.pack(fill="x", pady=(0, 9))
+        search_input = ttk.Entry(filter_bar, textvariable=self.search)
+        search_input.pack(side="left", fill="x", expand=True)
+        ttk.Combobox(filter_bar, textvariable=self.filter, values=["全部", "成功", "失敗"], state="readonly", width=6).pack(side="left", padx=(7, 0))
+        table_frame = ttk.Frame(right, style="Panel.TFrame")
+        table_frame.pack(fill="both", expand=True)
+        self.table = ttk.Treeview(table_frame, columns=("state", "title", "url"), show="headings", height=10)
+        for key, title, width in [("state", "狀態", 58), ("title", "來源", 165), ("url", "網址", 210)]:
+            self.table.heading(key, text=title)
+            self.table.column(key, width=width, minwidth=52, stretch=key != "state")
+        table_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview, style="Vertical.TScrollbar")
+        self.table.configure(yscrollcommand=table_scroll.set)
+        table_scroll.pack(side="right", fill="y")
+        self.table.pack(fill="both", expand=True)
+        self.table.bind("<<TreeviewSelect>>", self.preview)
+        privacy = tk.Frame(right, bg=colors["input"], highlightthickness=1, highlightbackground=colors["border"])
+        privacy.pack(fill="x", pady=(12, 0))
+        tk.Label(privacy, text="LOCAL-FIRST", bg=colors["input"], fg=colors["success"], font=("Consolas", 9, "bold")).pack(anchor="w", padx=11, pady=(9, 2))
+        tk.Label(privacy, text="依 robots.txt 檢查規則。雲端 AI 只有在你選用並確認後才傳送內容。",
+                 bg=colors["input"], fg=colors["muted"], font=("Microsoft JhengHei UI", 9),
+                 wraplength=310, justify="left").pack(anchor="w", padx=11, pady=(0, 10))
+        self.search.trace_add("write", lambda *_: self.refresh_table())
+        self.filter.trace_add("write", lambda *_: self.refresh_table())
         self.inputs = [self.urls, self.delay_input, self.timeout_input, self.selector_input, self.output_input, self.choose_button, self.import_button, self.retries_input, self.history_button]
-        self.inputs.extend([self.mode_input, self.model_input, self.paste_button, self.key_button, self.check_ai_button])
+        self.inputs.extend([self.mode_input, self.model_input, self.paste_button, self.key_button, self.check_ai_button, self.frames_input, self.vision_model_input])
+        self.model.trace_add("write", self._sync_header_badges)
+        self._sync_header_badges()
+
+    def _sync_header_badges(self, *_):
+        if not hasattr(self, "provider_badge"):
+            return
+        mode = AI_MODES.get(self.ai_mode.get(), "basic")
+        local = mode in {"ollama", "basic"}
+        label = "● LOCAL PROCESSING" if local else "● CLOUD API OPT-IN"
+        self.provider_badge.configure(
+            text=label,
+            bg="#13251e" if local else "#2a2112",
+            fg=self.ui_colors["success"] if local else self.ui_colors["warning"],
+            highlightbackground="#275441" if local else "#66502a",
+        )
+        model = self.model.get().strip() or ("NO MODEL" if mode == "basic" else "MODEL NOT SET")
+        self.model_badge.configure(text=model[:30])
 
     def toggle_advanced(self):
         if self.advanced.winfo_manager():
             self.advanced.pack_forget()
-            self.advanced_toggle.configure(text="設定與模型 ▸")
+            self.urls.pack(fill="x", before=self.advanced_toggle)
+            self.input_actions.pack(fill="x", pady=(8, 11), before=self.advanced_toggle)
+            self.advanced_toggle.configure(text="模型與擷取設定  ▸")
         else:
+            self.urls.pack_forget()
+            self.input_actions.pack_forget()
             self.advanced.pack(fill="x", before=self.actions)
-            self.advanced_toggle.configure(text="設定與模型 ▾")
+            self.advanced_toggle.configure(text="模型與擷取設定  ▾")
 
     def provider_hint(self):
         mode = AI_MODES.get(self.ai_mode.get(), 'basic')
@@ -236,6 +384,7 @@ class App(tk.Tk):
         self.model.set(self.provider_models[self.current_provider])
         self.model_input.configure(values=self.model_cache.get(self.current_provider, []))
         self.ai_hint.configure(text=self.provider_hint())
+        self._sync_header_badges()
 
     def selected_backend(self, for_listing=False):
         mode = AI_MODES.get(self.ai_mode.get(), 'basic')
@@ -393,6 +542,7 @@ class App(tk.Tk):
         else:
             self.copy_button.configure(state="disabled")
             self.file_button.configure(state="disabled")
+            self.export_button.configure(state="disabled")
             if query or self.filter.get() != "全部":
                 self.show_preview("請點選篩選後的結果以預覽。" if self.table.get_children() else "沒有符合條件的結果。")
 
@@ -418,7 +568,7 @@ class App(tk.Tk):
             provider = self.selected_backend()
             if mode in CLOUD_PROVIDERS and not messagebox.askyesno('使用雲端摘要',
                     f'本批 {len(urls)} 個來源的擷取文字／字幕將傳送至 {LABELS[mode]}，使用模型 {model}。\n\n'
-                    '每頁最多分析約 36,000 字元。影片分段生成後會逐項核對，另有多來源比較；每次格式失敗最多重試一次。\n'
+                    '每頁最多分析約 36,000 字元。若開啟畫面理解，最多 12 張關鍵影格會逐張傳送並分別核對；另有多來源比較。\n'
                     'API 可能計費，實際費用依模型及帳號而定。是否繼續？', parent=self):
                 return
             delay, timeout = float(self.delay.get()), int(self.timeout.get())
@@ -458,15 +608,18 @@ class App(tk.Tk):
         self.retry_button.configure(state="disabled")
         self.copy_button.configure(state="disabled")
         self.file_button.configure(state="disabled")
+        self.export_button.configure(state="disabled")
         for widget in self.inputs:
             widget.configure(state="disabled")
         self.status.set("正在啟動瀏覽器…")
         self.show_preview("正在爬取，結果會逐頁出現在上方。")
         self.save_preferences()
 
+        frames_enabled = self.analyze_frames.get()
+        visual_model = self.vision_model.get().strip() if mode == 'ollama' else model
         def work():
             try:
-                asyncio.run(crawl_batch(urls, output, delay, timeout, selector, self.stop_event, lambda kind, data: self.events.put((kind, data)), retries=retries, summary_mode=mode, model=model, pasted_text=pasted_text, provider=provider))
+                asyncio.run(crawl_batch(urls, output, delay, timeout, selector, self.stop_event, lambda kind, data: self.events.put((kind, data)), retries=retries, summary_mode=mode, model=model, pasted_text=pasted_text, provider=provider, analyze_frames=frames_enabled, vision_model=visual_model))
             except Exception as exc:
                 logging.exception("Crawl job failed")
                 self.events.put(("fatal", str(exc)))
@@ -569,6 +722,7 @@ class App(tk.Tk):
             available = bool(path and path.is_file())
             self.copy_button.configure(state="normal" if available else "disabled")
             self.file_button.configure(state="normal" if available else "disabled")
+            self.export_button.configure(state="normal" if available else "disabled")
             self.show_preview(path.read_text(encoding="utf-8")[:100000] if available else "兩個以上來源完成後，這裡會顯示共通點、差異與來源對照。")
             return
         selection = self.table.selection()
@@ -576,6 +730,7 @@ class App(tk.Tk):
             page = self.pages[int(selection[0])]
             self.copy_button.configure(state="normal")
             self.file_button.configure(state="normal" if page.success and page.file else "disabled")
+            self.export_button.configure(state="normal" if self.export_source() else "disabled")
             meta = f"{page.url}\nHTTP {page.status_code or '—'} · 嘗試 {page.attempts} 次 · {page.elapsed_seconds} 秒\n\n"
             if page.success and self.preview_mode.get() == "來源對照":
                 source_path = (self.folder / page.sources_file).resolve() if self.folder and page.sources_file else None
@@ -626,13 +781,83 @@ class App(tk.Tk):
             if self.preview_mode.get() == "來源對照" and page.sources_file:
                 filename = page.sources_file
             path = (self.folder / filename).resolve()
-            if path.parent != self.folder.resolve() or path.suffix != ".md" or not path.is_file():
+            if not path.is_relative_to(self.folder.resolve()) or path.suffix != ".md" or not path.is_file():
                 messagebox.showerror("無法開啟", "Markdown 檔案不存在或路徑不正確。", parent=self)
                 return
             try:
                 os.startfile(path)
             except OSError as exc:
                 messagebox.showerror("無法開啟", str(exc), parent=self)
+
+    def export_source(self):
+        """Return only a saved Markdown report inside the active result folder."""
+        if not self.folder:
+            return None
+        if self.preview_mode.get() in ("整批比較", "比較來源"):
+            filename = "batch_summary.md" if self.preview_mode.get() == "整批比較" else "batch_sources.md"
+        else:
+            selected = self.table.selection()
+            if not selected:
+                return None
+            page = self.pages[int(selected[0])]
+            filename = page.file
+            if self.preview_mode.get() == "重點摘要" and page.summary_file:
+                filename = page.summary_file
+            elif self.preview_mode.get() == "來源對照" and page.sources_file:
+                filename = page.sources_file
+        try:
+            path = (self.folder / filename).resolve()
+            root = self.folder.resolve()
+        except (OSError, TypeError):
+            return None
+        return path if path.is_relative_to(root) and path.suffix.lower() == ".md" and path.is_file() else None
+
+    def export_report(self):
+        source = self.export_source()
+        if not source:
+            messagebox.showinfo("一鍵匯出成果", "請先選擇一份已保存的報告。", parent=self)
+            return
+        selected = self.table.selection()
+        if self.preview_mode.get() in ("整批比較", "比較來源"):
+            title, source_url = "整批研究比較", ""
+        elif selected:
+            page = self.pages[int(selected[0])]
+            title, source_url = page.title or source.stem, page.final_url or page.url
+        else:
+            title, source_url = source.stem, ""
+        self.export_button.configure(state="disabled")
+        self.status.set("正在製作 PDF、Notion、Markdown 與 Obsidian Canvas…")
+        self.update_idletasks()
+        try:
+            result = build_deliverables(source, title, source_url)
+            self.status.set(f"成果已匯出 · {result['folder'].name}")
+            messagebox.showinfo("匯出完成", "已建立 PDF、Notion 匯入包、Markdown 與 Obsidian Canvas。", parent=self)
+            os.startfile(result["folder"])
+        except Exception as exc:
+            logging.exception("Deliverable export failed")
+            messagebox.showerror("匯出失敗", str(exc), parent=self)
+        finally:
+            self.export_button.configure(state="normal" if self.export_source() else "disabled")
+
+    def open_evidence(self):
+        selected = self.table.selection()
+        if not selected or not self.folder:
+            return
+        page = self.pages[int(selected[0])]
+        prefix = page.summary_file.split('_')[0]
+        if not prefix.isdigit():
+            return
+        target = (self.folder / (prefix + '_frames') / 'evidence.html').resolve()
+        if not target.is_relative_to(self.folder.resolve()) or not target.is_file():
+            messagebox.showinfo('影格溯源', '這筆結果沒有影格資料鏈；請開啟影片畫面理解後重新整理。', parent=self)
+            return
+        from evidence_chain import verify_chain
+        failures = verify_chain(target.parent)
+        if failures:
+            messagebox.showerror('來源完整性檢查失敗',
+                '檔案缺失或與保存時不符，請重新產生來源資料鏈。\n' + '\n'.join(failures[:5]), parent=self)
+            return
+        webbrowser.open(target.as_uri())
 
     def open_folder(self):
         if self.folder and self.folder.exists():
@@ -651,6 +876,25 @@ class App(tk.Tk):
             self.destroy()
 
 
-if __name__ == "__main__":
-    logging.basicConfig(filename=BASE / "app.log", level=logging.WARNING, encoding="utf-8", format="%(asctime)s %(levelname)s %(message)s")
+def packaged_smoke_test():
+    """Exercise the frozen browser stack without opening Tk; writes machine-readable evidence."""
+    target = sys.argv[2] if len(sys.argv) > 2 else "https://example.com/"
+    result_file = DATA_DIR / "exe-smoke-test.json"
+    record = {"target": target, "success": False}
+    try:
+        pages = asyncio.run(crawl_batch([target], DATA_DIR / "smoke-tests", .5, 30, "", threading.Event(), lambda *_: None,
+                                        retries=0, summary_mode="basic", model=""))
+        page = pages[0]
+        record.update(success=page.success, title=page.title, status_code=page.status_code,
+                      markdown_chars=len(page.markdown), error=page.error)
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    result_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if record["success"] else 1
+
+
+if __name__ == "__main__" and "--smoke-test" in sys.argv:
+    raise SystemExit(packaged_smoke_test())
+elif __name__ == "__main__":
+    logging.basicConfig(filename=LOG_FILE, level=logging.WARNING, encoding="utf-8", format="%(asctime)s %(levelname)s %(message)s")
     App().mainloop()

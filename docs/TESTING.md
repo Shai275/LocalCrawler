@@ -31,3 +31,20 @@ Video-summary update: 33 tests pass. Regression cases cover inherited timestamps
 Real integration checks: Windows Credential Manager store/read/delete used a unique disposable fake credential; installed Ollama qwen2.5:7b returned a source-linked summary through the new shared backend.
 
 Not yet verified: live OpenAI/Gemini calls with a user's paid API credentials; arbitrary models listed by each account; complete cross-machine installation. Model listing does not establish JSON Schema compatibility. No cloud API key was used during automated tests. Current GitHub CI status is separate from local results.
+
+## 3.3 frame validation — 2026-09-13
+
+38 local tests pass. New cases cover bounded timeline sampling, timestamped Markdown galleries, OCR/caption overlap, Gemini multimodal request formatting, and existing worker cancellation cleanup. A real run against the user-supplied nine-minute video produced eight distinct JPEG key frames across the timeline. Offline RapidOCR read the on-screen phrase `阿伯我們拿了9分`; it matched the nearby caption and a local qwen2.5vl:3b request produced a report with separate visual, OCR, caption, timestamp and frame evidence. This acceptance did not call a paid cloud model; live cloud vision quality remains pending.
+
+
+## 3.3 acceptance — 2026-09-21
+
+The actual user-supplied video 8NYdGenlji8 produced 24,479 caption characters and eight OCR-processed frames. The initial stream fell back to software; selecting H.264 first activated verified D3D11 decoding for all eight frames on RTX 4060. Real local qwen2.5vl:3b output repeated captions; the new filter correctly omitted these as novel visual insights and exported source-only evidence with passing integrity checks. This is a fallback acceptance, not a claim of semantic chart understanding.
+
+Regression coverage now includes temporal-only chart association, multiline transcript hashing on Windows, modified-HTML rejection through real Tk controls, and termination of descendant processes. Paid cloud model semantics, other operating systems, very long real videos, and global GPU/Ollama quotas remain outside this acceptance.
+
+## 3.4 acceptance — 2026-09-21
+
+Adaptive selection inspected a denser timeline of the public acceptance video and retained eight frames with full time coverage. Unlike uniform sampling, it selected a player-attribute radar chart and an interaction-control screen; all eight frames reported verified D3D11 decoding. Local qwen2.5vl:3b proposed attribute numbers absent from OCR/captions. The final validator rejected the entire note, retried once with the reason, then fell back to timestamped OCR text. This deliberately favors a reviewable omission over a fluent unsupported detail.
+
+A controlled bar chart and workflow fixture verified OCR layout fallback. It recovered `Q1 ↔ 20`, `Q2 ↔ 35`, `Q3 ↔ 50`, `Q4 ↔ 45` and the order `CAPTURE → EXTRACT → VERIFY`. The small local vision model did not provide a reliable semantic trend, so the report retained these as position-derived hints requiring image review. Full regression: 52 tests passed. No macOS/Linux or paid-cloud semantic acceptance is claimed.

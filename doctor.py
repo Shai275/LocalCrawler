@@ -6,7 +6,7 @@ import sys
 def main():
     print('Python:', sys.version.split()[0])
     missing = []
-    for module in ('tkinter', 'crawl4ai', 'playwright', 'youtube_transcript_api', 'yt_dlp', 'faster_whisper', 'httpx', 'keyring', 'opencc'):
+    for module in ('tkinter', 'crawl4ai', 'playwright', 'youtube_transcript_api', 'yt_dlp', 'faster_whisper', 'httpx', 'keyring', 'opencc', 'av', 'cv2', 'rapidocr', 'onnxruntime', 'psutil'):
         present = importlib.util.find_spec(module) is not None
         print(module + ':', 'OK' if present else 'MISSING')
         if not present:

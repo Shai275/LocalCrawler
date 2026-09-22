@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import sys
 import unittest
+import psutil
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,7 +19,7 @@ class VideoCancelTests(unittest.TestCase):
             async def fake_worker(*args, **kwargs):
                 folder = args[-1]
                 folders.append(Path(folder))
-                code = "import sys,time,pathlib; pathlib.Path(sys.argv[1],'audio.part').write_bytes(b'partial'); print('PROGRESS:ready',file=sys.stderr,flush=True); time.sleep(30)"
+                code = "import sys,time,pathlib,subprocess; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); pathlib.Path(sys.argv[1],'audio.part').write_bytes(b'partial'); print('PROGRESS:ready',file=sys.stderr,flush=True); time.sleep(30)"
                 process = await original(sys.executable, '-c', code, folder, **kwargs)
                 processes.append(process)
                 return process
@@ -26,9 +27,12 @@ class VideoCancelTests(unittest.TestCase):
                 task = asyncio.create_task(video.fetch_video('abcdefghijk', 5, lambda _: ready.set()))
                 await asyncio.wait_for(ready.wait(), 10)
                 self.assertTrue((folders[0] / 'audio.part').exists())
+                descendants = psutil.Process(processes[0].pid).children(recursive=True)
+                self.assertTrue(descendants)
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
             self.assertFalse(folders[0].exists())
             self.assertIsNotNone(processes[0].returncode)
+            self.assertTrue(all(not child.is_running() for child in descendants))
         asyncio.run(scenario())

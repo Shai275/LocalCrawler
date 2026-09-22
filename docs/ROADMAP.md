@@ -1,5 +1,21 @@
 # Product direction
 
+## 3.4 — adaptive visual evidence
+
+- [x] Opt-in bounded 720p public-video download and key-frame extraction
+- [x] Blank and near-duplicate filtering with a 12-frame cap
+- [x] Timestamped Markdown gallery retained without AI
+- [x] Multimodal request adapters for Ollama, OpenAI and Gemini
+- [x] Conservative visible-text, chart, slide and interface prompt
+- [x] Test a real local qwen2.5vl:3b model with offline OCR/caption evidence matching
+- [x] Score up to 48 candidates and retain one information-rich frame per time segment
+- [x] Preserve OCR coordinates and expose conservative chart label/value and flow-order hints
+- [x] Reject close caption paraphrases and retain source-only evidence when vision adds nothing
+- [x] Add evidence timeline and association/decoder status summary
+- [ ] Test live cloud vision accounts
+- [ ] Evaluate chart semantics with several real slide-deck videos and larger vision models
+- [ ] Package and verify macOS and Linux launch/install flows
+
 The useful distinction is source-linked research, not the number of pages downloaded. A successful workflow ends with a report a reader can verify and use.
 
 ## Current architecture

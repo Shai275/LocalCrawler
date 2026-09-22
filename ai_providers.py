@@ -128,6 +128,48 @@ class AIProvider:
                     feedback = getattr(exc, 'retry_feedback', '')
         raise ProviderError("模型回覆未通過格式或來源編號檢查（可能拒答或超過輸出長度）" + ('；' + feedback if feedback else ''))
 
+    async def structured_vision_reply(self, model, instruction, content, images, schema, validate):
+        """Structured multimodal request. Images are bounded JPEG base64 strings."""
+        if self.name == "basic":
+            raise ProviderError("基本摘錄不使用視覺 AI")
+        validate_provider_config(AIProviderConfig(self.name, model))
+        if not 1 <= len(images) <= 12 or any(len(x.get("data", "")) > 2_500_000 for x in images):
+            raise ProviderError("影格數量或大小超過安全上限")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240, connect=8), trust_env=False, follow_redirects=False) as client:
+            if self.name == "ollama":
+                # Some Ollama vision models return an empty response for a full
+                # JSON Schema while supporting JSON mode. We still validate the
+                # decoded object locally before accepting it.
+                props = schema.get('properties', {}).get('notes', {}).get('items', {}).get('properties', {})
+                example = {}
+                for key, spec in props.items():
+                    enum = spec.get('enum', []) if isinstance(spec, dict) else []
+                    example[key] = enum[0] if enum else '...'
+                shape = json.dumps({'notes': [example]}, ensure_ascii=False, separators=(',', ':'))
+                message = {"role": "user", "content": content + "\n只輸出 JSON，格式例如：" + shape, "images": [x["data"] for x in images]}
+                data = await self.request(client, "post", "/api/chat", json={"model": model, "stream": False, "format": "json",
+                    "messages": [{"role": "system", "content": instruction}, message], "options": {"temperature": 0, "num_predict": 2400, "num_thread": 2, "num_ctx": 4096}})
+                raw = data.get("message", {}).get("content", "")
+            elif self.name == "openai":
+                parts = [{"type": "text", "text": content}]
+                parts += [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + x["data"], "detail": "low"}} for x in images]
+                data = await self.request(client, "post", "/chat/completions", json={"model": model, "store": False,
+                    "messages": [{"role": "system", "content": instruction}, {"role": "user", "content": parts}],
+                    "max_completion_tokens": 4000, "response_format": {"type": "json_schema", "json_schema": {"name": "visual_notes", "strict": True, "schema": schema}}})
+                raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            else:
+                parts = [{"text": content}]
+                parts += [{"inlineData": {"mimeType": "image/jpeg", "data": x["data"]}} for x in images]
+                data = await self.request(client, "post", f"/models/{model}:generateContent", json={"systemInstruction": {"parts": [{"text": instruction}]},
+                    "contents": [{"role": "user", "parts": parts}], "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": schema, "maxOutputTokens": 4000}})
+                raw = "".join(p.get("text", "") for p in data.get("candidates", [{}])[0].get("content", {}).get("parts", []) if not p.get("thought"))
+            try:
+                answer = json.loads(raw)
+                validate(answer)
+                return answer
+            except (ValueError, TypeError, KeyError, IndexError):
+                raise ProviderError("視覺模型回覆未通過格式檢查；關鍵影格仍已保存") from None
+
 
 def create_provider(config, **kwargs):
     return AIProvider(config, **kwargs)

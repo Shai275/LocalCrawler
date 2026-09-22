@@ -1,1 +1,14 @@
-
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "啟動本機爬蟲",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {"PYTHONUTF8": "1"}
+    }
+  ]
+}

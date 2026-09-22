@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--provider', choices=SUPPORTED_PROVIDERS, default='ollama')
     parser.add_argument('--model', help='Model ID; required for cloud providers')
     parser.add_argument('--allow-cloud', action='store_true', help='Consent to sending extracted text to the selected cloud API')
+    parser.add_argument('--analyze-frames', action='store_true', help='Save and optionally analyze up to 12 key video frames')
+    parser.add_argument('--vision-model', default='qwen2.5vl:3b', help='Ollama vision model used with --analyze-frames')
     args = parser.parse_args()
     stop = threading.Event()
     def emit(kind, value):
@@ -34,7 +36,8 @@ def main():
                 key = load_key(mode)
         provider = create_provider(AIProviderConfig(mode, model), api_key=key, cloud_allowed=args.allow_cloud)
         results = asyncio.run(crawl_batch(parse_urls('\n'.join(args.urls)), args.output, 1, 40, '', stop, emit,
-                                         summary_mode=mode, model=model, provider=provider))
+                                         summary_mode=mode, model=model, provider=provider, analyze_frames=args.analyze_frames,
+                                         vision_model=args.vision_model if mode == 'ollama' else model))
     except (ValueError, OSError) as exc:
         parser.exit(2, str(exc) + '\n')
     except KeyboardInterrupt:

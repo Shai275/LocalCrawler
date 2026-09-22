@@ -11,6 +11,31 @@ from engine import Page
 
 
 class AppTests(unittest.TestCase):
+    def test_evidence_view_blocks_modified_report(self):
+        from evidence_chain import export_chain
+        with tempfile.TemporaryDirectory() as temp, patch.object(app, 'PREFERENCES', Path(temp)/'settings.json'):
+            window = app.App()
+            window.withdraw()
+            try:
+                window.folder = Path(temp)
+                folder = Path(temp)/'001_frames'
+                folder.mkdir()
+                export_chain(folder, 'abcdefghijk', [], [], '原文\n第二行', 'basic', '')
+                window.pages = [Page(url='https://youtube.com/watch?v=abcdefghijk', success=True, summary_file='001_summary.md')]
+                window.refresh_table()
+                window.table.selection_set('0')
+                with patch.object(app.webbrowser, 'open') as opened, patch.object(app.messagebox, 'showerror') as error:
+                    window.open_evidence()
+                    opened.assert_called_once()
+                    error.assert_not_called()
+                    opened.reset_mock()
+                    (folder/'evidence.html').write_text('modified', encoding='utf-8')
+                    window.open_evidence()
+                    opened.assert_not_called()
+                    error.assert_called_once()
+            finally:
+                window.destroy()
+
     def test_cloud_switching_secret_preferences_and_declined_send(self):
         import json
         with tempfile.TemporaryDirectory() as temp, patch.object(app, 'PREFERENCES', Path(temp) / 'settings.json'):

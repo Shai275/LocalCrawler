@@ -109,7 +109,8 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                       selector: str, stop: threading.Event,
                       emit: Callable[[str, object], None], retries: int = 1,
                       summary_mode: str = "basic", model: str = DEFAULT_MODEL,
-                      pasted_text: str | None = None, provider=None) -> list[Page]:
+                      pasted_text: str | None = None, provider=None,
+                      analyze_frames: bool = False, vision_model: str = "") -> list[Page]:
     # Delay heavy imports until a job starts so the desktop opens immediately.
     from bs4 import BeautifulSoup
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
@@ -140,7 +141,8 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                 "pending_urls": [url for url in urls if url not in completed],
                 "summary_pending_urls": [p.url for p in pages if p.success and not p.summary],
                 "completed": len(pages), "error": error,
-                "ai_provider": summary_mode, "ai_model": model if summary_mode != 'basic' else ''}
+                "ai_provider": summary_mode, "ai_model": model if summary_mode != 'basic' else '',
+                "analyze_frames": bool(analyze_frames)}
         temp = folder / "run.json.tmp"
         temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(folder / "run.json")
@@ -206,16 +208,20 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                         if video_id:
                             emit("stage", "正在取得 YouTube 字幕；若沒有字幕會改用本機語音轉文字…")
                             begin = time.monotonic()
-                            data = await fetch_video(video_id, timeout, lambda message: emit("stage", message))
+                            frame_dir = folder / f"{index + 1:03d}_frames" if analyze_frames else None
+                            data = await fetch_video(video_id, timeout, lambda message: emit("stage", message), frame_dir)
                             page = Page(url=url, final_url=f"https://www.youtube.com/watch?v={video_id}", title=data["title"], source_type="youtube", success=True, markdown=data["markdown"], language=data["language"], attempts=1, elapsed_seconds=round(time.monotonic() - begin, 2), crawled_at=datetime.now().astimezone().isoformat(timespec="seconds"))
                             if data.get("audio_transcribed"):
                                 page.summary_warning = "影片未提供字幕；此內容由本機 Whisper 語音轉文字產生，可能有辨識錯誤。暫存音訊已在轉錄後刪除。"
                             elif data.get("generated"):
                                 page.summary_warning = "來源為 YouTube 自動字幕，可能有辨識錯誤。"
+                            if data.get("frame_warning"):
+                                page.summary_warning = "\n".join(filter(None, [page.summary_warning, data["frame_warning"]]))
+                            page._frames = data.get("frames", [])
                         else:
                             if crawler is None:
                                 from secure_browser import verified_strategy
-                                config = BrowserConfig(headless=True, verbose=False, ignore_https_errors=False, user_agent="LocalCrawler/3.1.1")
+                                config = BrowserConfig(headless=True, verbose=False, ignore_https_errors=False, user_agent="LocalCrawler/3.4")
                                 crawler = await stack.enter_async_context(AsyncWebCrawler(config=config, crawler_strategy=verified_strategy(config)))
                             page = await fetch(crawler, url)
                     except (ValueError, asyncio.TimeoutError) as exc:
@@ -231,6 +237,22 @@ async def crawl_batch(urls: list[str], output: Path, delay: float, timeout: int,
                     emit("page", page)
                     emit("stage", f"正在整理重點 · {page.title[:50]}")
                     insight = await summarize(page.markdown, page.final_url or page.url, summary_mode, model, lambda message: emit("stage", message), provider=provider, title=page.title, source_type=page.source_type)
+                    frames = getattr(page, "_frames", [])
+                    if frames:
+                        from video_frames import render_gallery
+                        from visual_insights import export_frame_sources
+                        export_frame_sources(frames, frame_dir, video_id, page.markdown)
+                        visual = render_gallery(frames, video_id, frame_dir.name)
+                        if summary_mode != "basic":
+                            try:
+                                from visual_insights import summarize_frames
+                                emit("stage", f"{page.title[:40]} · 正在理解投影片、圖表與畫面…")
+                                visual = await summarize_frames(provider, vision_model or model, frames, frame_dir, video_id, page.markdown) + "\n\n" + visual
+                            except Exception as exc:
+                                visual = "畫面 AI 分析未完成；以下關鍵影格仍可人工核對。\n\n" + visual
+                                reason = str(exc) if type(exc).__name__ == "ProviderError" else "視覺分析發生未預期錯誤。"
+                                page.summary_warning = "\n".join(filter(None, [page.summary_warning, reason]))
+                        insight.summary += "\n\n" + visual
                     page.summary, page.summary_mode = insight.summary, insight.mode
                     page.summary_warning = "\n".join(filter(None, [page.summary_warning, insight.warning]))
                     page.facts = insight.facts
